@@ -1,0 +1,310 @@
+def solve_RCPSPTT_CP4(N, M, p, C, R, e, ES=None, LS=None, EF=None, LF=None, delta=None, res_move=None, upper_bound=None,
+                      relax_capacities=0.0, warmstart=None, time_limit=None, log=Normal,
+                      visualize=False, validate=True, print_sol=False, edge_set=None, thread_count=None,
+                      use_span=False, use_reservoir=True,
+                      # RCPSPTT-2
+                      support_matrix=None, C_sec=None, delta_sec=None
+                      )
+    Uses the optional interval variable and variable height of transition pulse to formulate transitions
+    model = CpoModel()
+
+    # TODO precedence pruning based on ESLS and propagated precedences
+    e = transitive_closure(e)
+
+    # Calculate feasible connections
+    if res_move is None
+        res_move = possible_resource_move_between_activity_pair(N, M, R, C, e, delta, ES, LS, EF, 1000)
+
+    # ESLS does not seem to really help (improved LS and possible ES could be calculate by heuristic)
+    if ES is not None and LS is not None
+        activities = [model.interval_var(start=(ES[i], LS[i]), end=(EF[i], LF[i]),
+                                         size=p[i], name=fact_{i})
+                      for i in range(N)]  # Variables Activity intervals
+    else
+        activities = [model.interval_var(size=p[i], name=fact_{i}) for i in range(N)]  # Variables Activity intervals
+
+    # Create a dictionary to store interval variables
+    interval_vars, sec_interval_vars, all_pulses, zero_flows = {}, {}, {}, {}
+
+    # RCPSPTT-2
+    sec_pulses = {}  # NEW {(i,j,r,ell) pulse(...)} for secondaryescort capacity
+    sec_flows = {}
+    L_sec = 0 if C_sec is None else len(C_sec)
+
+    # Create optional variables, flow count variables, connect flow and presence and put interval in correct place
+    for i, j, r in res_move.keys()
+        # Note precalculating startend is making the model perform terrible
+        if ES is not None and LS is not None
+            interval_vars[(i, j, r)] = model.interval_var(size=int(delta[i, j, r]), optional=True,
+                                                          start=(ES[i], LS[j] - int(delta[i, j, r])),
+                                                          end=(EF[i] + int(delta[i, j, r]), LS[j]),
+                                                          name=f'interval_{i}_{j}_{r}')
+        else
+            interval_vars[(i, j, r)] = model.interval_var(size=int(delta[i, j, r]), optional=True,
+                                                          name=f'interval_{i}_{j}_{r}')
+
+        model.add(model.end_before_start(activities[i], interval_vars[(i, j, r)]))  # (18a)
+        if not use_span
+            model.add(model.end_before_start(interval_vars[(i, j, r)], activities[j]))  # (18b)
+
+        # Note created for all transfers (not only the 0 ones) to be able to extract flow from height_at_start
+        zero_flows[(i, j, r)] = model.integer_var(min=0, max=res_move[(i, j, r)])
+        if delta[i, j, r] == 0
+            model.add(
+                model.if_then(
+                    zero_flows[(i, j, r)] = 1,
+                    model.presence_of(interval_vars[(i, j, r)])
+                )
+            )  # (15)
+        else
+            all_pulses[(i, j, r)] = model.pulse(interval_vars[i, j, r], (0, res_move[i, j, r]))
+
+        # RCPSPTT-2
+        if support_matrix is not None and C_sec is not None
+            for r2 in range(L_sec)
+                a = int(support_matrix[r, r2])
+                if a  0
+                    if delta_sec is not None
+                        # Avoid setups that are to same place (0 length)
+                        if delta[i, j, r]  0 and delta_sec[i, j, r2]  0
+                            if ES is not None and LS is not None
+                                sec_interval_vars[(i, j, r, r2)] = model.interval_var(
+                                    size=int(delta_sec[i, j, r2]), optional=True,
+                                    start=(ES[i], LS[j] - int(delta_sec[i, j, r2])),
+                                    end=(EF[i] + int(delta_sec[i, j, r2]), LS[j]),
+                                    name=f'sec interval_{i}_{j}_{r}_{r2}')
+                            else
+                                sec_interval_vars[(i, j, r, r2)] = model.interval_var(size=int(delta_sec[i, j, r2]),
+                                                                                      optional=True,
+                                                                                      name=f'sec interval_{i}_{j}_{r}_{r2}')
+
+                            sec_flows[(i, j, r, r2)] = model.integer_var(
+                                min=0, max=int(res_move[(i, j, r)]  support_matrix[r, r2]))
+
+                            model.add(
+                                model.start_before_start(interval_vars[(i, j, r)], sec_interval_vars[(i, j, r, r2)]))
+                            model.add(model.end_before_end(sec_interval_vars[(i, j, r, r2)], interval_vars[(i, j, r)]))
+
+                            sec_pulses[(i, j, r, r2)] = model.pulse(
+                                sec_interval_vars[i, j, r, r2],
+                                (0, a  res_move[(i, j, r)])
+                            )
+
+                            # (22)
+                            model.add(sec_flows[(i, j, r, r2)] == model.height_at_start(sec_interval_vars[i, j, r, r2],
+                                                                                        sec_pulses[(i, j, r, r2)]))
+
+                            model.add(
+                                model.height_at_start(
+                                    sec_interval_vars[i, j, r, r2],
+                                    sec_pulses[(i, j, r, r2)])
+                                == zero_flows[(i, j, r)]  a
+                            )  # (21)
+
+                    else
+                        # Avoid setups that are to same place (0 length)
+                        if delta[i, j, r]  0
+                            sec_pulses[(i, j, r, r2)] = model.pulse(
+                                interval_vars[i, j, r],
+                                (0, a  res_move[(i, j, r)])
+                            )
+                            model.add(
+                                model.height_at_start(interval_vars[i, j, r], sec_pulses[(i, j, r, r2)])
+                                == zero_flows[(i, j, r)]  a
+                            )  # (20)
+
+    # SPAN
+    if use_span
+        all_transitions = {}
+        for j in range(N)
+            for r in range(M)
+                if R[j, r]  0
+                    transition_list = []
+                    for i in range(N)
+                        if (i, j, r) in interval_vars
+                            transition_list.append(interval_vars[i, j, r])
+
+                    all_transitions[(j, r)] = model.interval_var()
+                    model.add(model.span(all_transitions[(j, r)], transition_list))
+                    model.add(model.end_before_start(all_transitions[(j, r)], activities[j]))
+
+    # Reservoir
+    if use_reservoir
+        for j in range(N)
+            for r in range(M)
+                if R[j, r]  0
+                    step_list = []
+                    for i in range(N)
+                        if (i, j, r) in interval_vars
+                            step_list.append(model.step_at_end(
+                                interval_vars[i, j, r],
+                                [0, res_move[(i, j, r)]])
+                            )
+
+                    step_sum = model.sum(step_list)
+                    model.add(model.greater_or_equal(step_sum - model.step_at_start(activities[j], R[j, r]), 0))
+
+    # Warmstart
+    if warmstart is not None
+        # Create solution object
+        partial_solution = CpoModelSolution()
+
+        # Set activity start times
+        if activity_starts in warmstart
+            for i in range(N)
+                partial_solution.add_interval_var_solution(
+                    activities[i],
+                    start=warmstart[activity_starts][i],
+                    end=warmstart[activity_starts][i] + p[i]
+                )
+
+                if use_span
+                    for r in range(M)
+                        if R[i, r]  0
+                            minStart = 9999
+                            maxEnd = 0
+                            for j in range(N)
+                                if (j, i, r) in warmstart[flows]
+                                    if warmstart[flows][j, i, r][amount]  0
+                                        minStart = min(minStart, warmstart[flows][j, i, r][start])
+                                        maxEnd = max(maxEnd, warmstart[flows][j, i, r][end])
+
+                            partial_solution.add_interval_var_solution(all_transitions[i, r],
+                                                                       start=minStart, end=maxEnd)
+
+        # Set flows
+        for (i, j, r), data in warmstart[flows].items()
+            # Deleted repair code at 05112025, 1312 (should not be necessary)
+            if (i, j, r) not in interval_vars
+                print(Missing interval var, i, j, r, for the warmstart flow)
+            if (i, j, r) not in zero_flows
+                print(Missing zero flow, i, j, r, for the warmstart flow)
+
+            if data[amount]  0
+                if start in data and end in data
+                    partial_solution.add_interval_var_solution(
+                        interval_vars[(i, j, r)],
+                        start=data[start], end=data[end], presence=True
+                    )
+                else
+                    partial_solution.add_interval_var_solution(interval_vars[(i, j, r)], presence=True)
+
+                if delta_sec is not None
+                    for r2 in range(L_sec)
+                        if delta[i, j, r]  0 and delta_sec[i, j, r2]  0
+                            r2_flow = int(support_matrix[r, r2])  data[amount]
+                            if r2_flow  0
+                                # TODO setting also end seems worse
+                                partial_solution.add_interval_var_solution(sec_interval_vars[(i, j, r, r2)],
+                                                                           start=data[start], presence=True)
+
+                partial_solution.add_integer_var_solution(
+                    zero_flows[(i, j, r)],
+                    value=data[amount]
+                )
+
+    # Flow preservation
+    for i in range(N)
+        for r in range(M)
+            if R[i, r]  0 or i == 0
+                inc = 0
+                out = 0
+                for j in range(N)
+                    if (j, i, r) in interval_vars
+                        if delta[j, i, r] == 0
+                            inc += zero_flows[(j, i, r)]
+                        else
+                            # TODO for height extraction
+                            model.add(zero_flows[(j, i, r)] ==
+                                      model.height_at_start(interval_vars[j, i, r], all_pulses[(j, i, r)]))
+                            inc += model.height_at_start(interval_vars[j, i, r], all_pulses[(j, i, r)])
+                    if (i, j, r) in interval_vars
+                        if delta[i, j, r] == 0
+                            out += zero_flows[(i, j, r)]
+                        else
+                            # TODO for height extraction
+                            model.add(zero_flows[(i, j, r)] ==
+                                      model.height_at_start(interval_vars[i, j, r], all_pulses[(i, j, r)]))
+                            out += model.height_at_start(interval_vars[i, j, r], all_pulses[(i, j, r)])
+
+                max_capacity = R[i, r] if i  0 else C[r]  # (14)
+                model.add(out == max_capacity)  # (17)
+                if i  0
+                    model.add(inc == max_capacity)  # (16)
+
+    # Rest of standard RCPSP
+    for k in range(M)
+        pulse_sum = model.sum(
+            [model.pulse(activities[i], R[(i, k)]) for i in range(N) if (i, k) in R and R[i, k]  0]
+            +
+            [all_pulses[(i, j, r)] for (i, j, r) in all_pulses.keys() if r == k]
+        )
+        model.add(pulse_sum = C[k])  # (19) Constraints Resources
+
+    # RCPSPTT-2 secondary resource cumulative
+    if support_matrix is not None and C_sec is not None
+        for ell in range(L_sec)
+            sec_sum = model.sum([sec_pulses[key] for key in sec_pulses.keys() if key[3] == ell])
+            model.add(sec_sum = C_sec[ell])  # (21)
+
+    model.add(model.end_before_start(activities[i], activities[j]) for (i, j) in e)  # (13) Constraints Precedences
+    model.add(model.minimize(model.end_of(activities[N - 1])))  # (12) Obj min(max_end_time)
+
+    if warmstart is not None
+        model.set_starting_point(partial_solution)
+
+    if upper_bound is not None
+        model.add(model.end_of(activities[N - 1]) = upper_bound)
+
+    # TODO zkusit parametry
+    params = CpoParameters()  # CumulFunctionInferenceLevel=Extended
+    if thread_count is not None
+        params.Workers = thread_count
+    params.LogVerbosity = log
+    params.TimeLimit = time_limit
+    # params.SolutionLimit = solution_limit
+    # params.RelativeOptimalityTolerance = gap
+    solution = model.solve(params=params)
+    status = solution.get_solve_status()
+
+    if status == Infeasible
+        print(Model is infeasible.)
+        cp_build_infeasible_set(model)
+
+    # Print solution
+    if solution
+        if print_sol
+            for i in range(N)
+                print(fTask {i} Start at {solution[activities[i]].start}, End at {solution[activities[i]].end})
+
+            total_transfers = 0
+            for i, j, r in res_move.keys()
+                try
+                    transfer_id = f({i},{j},{r})
+                    print(transfer_id +  s,
+                          solution[interval_vars[(i, j, r)]].start,
+                          e, solution[interval_vars[(i, j, r)]].end,
+                          amount, solution[zero_flows[(i, j, r)]])
+                    total_transfers += 1
+                except
+                    continue
+                    print(i, j, r,  not assigned)
+
+            print(total transfers, total_transfers)
+
+        schedule, setups, usage_by_resource, sec_setups, sec_usage_by_resource = extract_cp_solution_data(
+            solution, activities, R, C, solution.get_objective_value(), interval_vars, zero_flows,
+            # RCPSPTT-2
+            sec_setup_variables=sec_interval_vars, sec_setup_flows=sec_flows, support_matrix=support_matrix,
+            delta_sec=delta_sec)
+
+        if validate
+            validate_solution(schedule, p, C, R, e, delta, setups, support_matrix=support_matrix, C_sec=C_sec,
+                              delta_sec=delta_sec, sec_setups=sec_setups)
+        if visualize
+            draw_gantt_and_resource_chart(schedule, usage_by_resource, C, sec_usage_by_resource, C_sec)
+
+    else
+        print(No solution found)
+
+    return solution, activities, interval_vars, zero_flows, res_move
