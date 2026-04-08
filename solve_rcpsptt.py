@@ -397,7 +397,7 @@ def solve_with_cpo(mdl, nb_workers, time_limit, log_verbosity):
     return cmax, state, wall_time, best_solution_time
 
 
-def solve_with_optal(mdl, nb_workers, time_limit, log_verbosity):
+def solve_with_optal(mdl, nb_workers, time_limit, log_verbosity, tuned=False):
     """Run OptalCP solver. Returns result dict."""
     params = {
         "timeLimit": time_limit,
@@ -405,6 +405,13 @@ def solve_with_optal(mdl, nb_workers, time_limit, log_verbosity):
         "logLevel": min(log_verbosity, 2),
         "logPeriod": 5,
     }
+    if tuned:
+        params.update({
+            "searchType": "FDSDual",
+            "noOverlapPropagationLevel": 4,
+            "cumulPropagationLevel": 3,
+            "reservoirPropagationLevel": 2,
+        })
 
     t0 = time.monotonic()
     result = mdl.solve(params)
@@ -445,7 +452,8 @@ def solve_with_optal(mdl, nb_workers, time_limit, log_verbosity):
 # SOLVE SINGLE INSTANCE
 # =============================================================================
 
-def solve_instance(filepath, solver_name, nb_workers, time_limit, log_verbosity):
+def solve_instance(filepath, solver_name, nb_workers, time_limit, log_verbosity,
+                   tuned=False):
     """Solve one RCPSPTT instance. Returns a result dict (JSON-serializable)."""
     inst = load_instance(filepath)
 
@@ -461,11 +469,12 @@ def solve_instance(filepath, solver_name, nb_workers, time_limit, log_verbosity)
             mdl, nb_workers, time_limit, log_verbosity)
     else:
         cmax, state, wall_time, best_solution_time = solve_with_optal(
-            mdl, nb_workers, time_limit, log_verbosity)
+            mdl, nb_workers, time_limit, log_verbosity, tuned=tuned)
 
     return {
         "instance": inst['name'],
         "solver": solver_name,
+        "tuned": tuned,
         "n_jobs": inst['abs_A'],
         "n_resources": inst['abs_R'],
         "objective": cmax,
@@ -510,7 +519,7 @@ def collect_instances(data_dir, sets=None):
 # =============================================================================
 
 def run_solver_batch(instances, solver_name, nb_workers, time_limit,
-                     log_verbosity, out_file):
+                     log_verbosity, out_file, tuned=False):
     """Run a solver on all instances, tracking results as JSON.
 
     Supports resume: if out_file exists, previously solved instances are skipped.
@@ -544,7 +553,7 @@ def run_solver_batch(instances, solver_name, nb_workers, time_limit,
         try:
             result = solve_instance(
                 str(instance_path), solver_name,
-                nb_workers, time_limit, log_verbosity)
+                nb_workers, time_limit, log_verbosity, tuned=tuned)
 
             bst = result['best_solution_time']
             bst_str = f"{bst}s" if bst is not None else "N/A"
@@ -642,6 +651,10 @@ Examples:
     parser.add_argument('--output', type=str, default=None,
                         help='Output directory for results (default: results/rcpsptt/)')
 
+    # Tuning
+    parser.add_argument('--tuned', action='store_true',
+                        help='Use tuned OptalCP parameters (FDSDual, propagation levels)')
+
     # Misc
     parser.add_argument('--dry-run', action='store_true',
                         help='Show instances that would be solved without running')
@@ -720,7 +733,7 @@ Examples:
         results = run_solver_batch(
             instances, solver_name,
             args.workers, args.timeLimit, args.logLevel,
-            out_file=out_file
+            out_file=out_file, tuned=args.tuned
         )
 
         print(f"\n  Saved: {out_file}")
