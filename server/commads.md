@@ -72,3 +72,40 @@ rsync -avP -e 'ssh -p 2228' \
 
 # Inside the Docker container:
 PYTHON=$(which python3) bash run_t1_all.sh
+
+
+# =============================================================================
+# RCPSPTT — Setup-Time Formulation Experiments
+# =============================================================================
+
+# 1. Push code + data to krocan
+rsync -avP -e 'ssh -p 2228' \
+  ~/Desktop/CIIRC/RCPSPTT/solve_rcpsptt.py \
+  ~/Desktop/CIIRC/RCPSPTT/run_rcpsptt.sh \
+  radovluk@rtime.ciirc.cvut.cz:~/rcpsptt/
+
+rsync -avP -e 'ssh -p 2228' \
+  ~/Desktop/CIIRC/RCPSPTT/data/rcpsp_tt_instances/ \
+  radovluk@rtime.ciirc.cvut.cz:~/rcpsptt/data/rcpsp_tt_instances/
+
+rsync -avP -e 'ssh -p 2228' \
+  ~/Desktop/CIIRC/RCPSPTT/kraus-diplomka/kraus_instances/ \
+  radovluk@rtime.ciirc.cvut.cz:~/rcpsptt/kraus-diplomka/kraus_instances/
+
+# 2. SSH + Docker
+ssh -p 2228 radovluk@rtime.ciirc.cvut.cz
+docker run --rm -it -v ~/rcpsptt:/workspace optalcp-solver:latest bash
+
+# 3. Run in tmux
+tmux new -s rcpsptt
+cd /workspace
+PYTHON=$(which python3) WORKERS=32 TIME_LIMIT=120 bash run_rcpsptt.sh
+
+# Or run only PSPLIB / only Kraus:
+PYTHON=$(which python3) WORKERS=32 TIME_LIMIT=120 bash run_rcpsptt.sh psplib
+PYTHON=$(which python3) WORKERS=32 TIME_LIMIT=120 bash run_rcpsptt.sh kraus
+
+# 4. Retrieve results
+rsync -avP -e 'ssh -p 2228' \
+  radovluk@rtime.ciirc.cvut.cz:~/rcpsptt/results/ \
+  ~/Desktop/CIIRC/RCPSPTT/results/server/

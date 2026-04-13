@@ -25,7 +25,9 @@ Usage:
 
 import argparse
 import json
+import math
 import re
+import signal
 import sys
 import time
 from pathlib import Path
@@ -39,6 +41,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = SCRIPT_DIR / "data" / "rcpsp_tt_instances"
 
 SETS = ["j30", "j60", "j90", "j120"]
+
+# Kraus JSON preprocessing constants (match Kraus's parser)
+KRAUS_MAX_HEIGHT = 1000
+KRAUS_AVERAGE_LEN_MULT = 2
 
 
 # =============================================================================
@@ -168,6 +174,135 @@ def load_instance(filepath):
             Delta[i].append([])
             for r in range(abs_R):
                 Delta[i][j].append(data['transfer_times'][r][i][j])
+
+    T = compute_possible_transfers(abs_A, abs_R, Q, C, E)
+
+    return {
+        'abs_A': abs_A, 'abs_R': abs_R, 'p': p, 'C': C, 'Q': Q,
+        'E': E, 'Delta': Delta, 'T': T, 'name': Path(filepath).stem,
+    }
+
+
+# =============================================================================
+# KRAUS JSON INSTANCE LOADING
+# =============================================================================
+
+def load_kraus_instance(filepath):
+    """Load and preprocess a Kraus JSON instance directly.
+
+    Applies the same filtering/curbing as Kraus's parser:
+      - Skip tasks whose element has z > MAX_HEIGHT or is at (0,0,0)
+      - Curb overly long tasks (> 2× average duration)
+      - Add supersource (index 0) and supersink (index abs_A-1)
+      - Compute transfer times as Euclidean distances between elements
+
+    Returns the same dict format as load_instance().
+    """
+    with open(filepath) as f:
+        data = json.load(f)
+
+    elements_by_id = {e["elementId"]: e for e in data["elements"]}
+
+    # Filter tasks
+    tasks = []
+    task_elements = {}
+    total_duration = 0
+    for t in data["tasks"]:
+        elem = elements_by_id.get(t["elementId"])
+        if elem is None:
+            continue
+        if elem["z"] > KRAUS_MAX_HEIGHT:
+            continue
+        if elem["x"] == 0 and elem["y"] == 0 and elem["z"] == 0:
+            continue
+        tasks.append(t)
+        task_elements[t["taskId"]] = elem
+        total_duration += int(t["duration"])
+
+    if not tasks:
+        raise ValueError(f"No valid tasks in {filepath}")
+
+    # Curb overly long tasks
+    avg_dur = total_duration // len(tasks)
+    for t in tasks:
+        d = int(t["duration"])
+        if d > KRAUS_AVERAGE_LEN_MULT * avg_dur:
+            t["duration"] = avg_dur + d % avg_dur
+        else:
+            t["duration"] = d
+
+    task_ids = [t["taskId"] for t in tasks]
+    task_id_set = set(task_ids)
+    n_real = len(tasks)
+
+    # Resources
+    all_resources = sorted(data["capacitiesByResource"].keys())
+    abs_R = len(all_resources)
+    res_index = {r: i for i, r in enumerate(all_resources)}
+    C = [min(int(data["capacitiesByResource"][r]), 1000) for r in all_resources]
+
+    # Jobs: 0=supersource, 1..n_real=tasks, n_real+1=supersink
+    abs_A = n_real + 2
+    p = [0]  # supersource duration
+    Q = [C[:]]  # supersource demands = capacities (so flow conservation works)
+
+    task_index = {}  # taskId -> 0-based job index (1..n_real)
+    for i, t in enumerate(tasks):
+        task_index[t["taskId"]] = i + 1
+        p.append(int(t["duration"]))
+        row = [0] * abs_R
+        reqs = data.get("resourceRequirementsByTask", {}).get(t["taskId"], {})
+        for res_name, need in reqs.items():
+            if res_name in res_index:
+                ri = res_index[res_name]
+                row[ri] = min(int(need), C[ri])
+        Q.append(row)
+
+    p.append(0)  # supersink duration
+    Q.append(C[:])  # supersink demands = capacities
+
+    # Precedence arcs (0-based)
+    arcs = []
+    has_predecessor = set()
+    has_successor = set()
+    for prec in data.get("precedences", []):
+        from_id, to_id = prec["from"], prec["to"]
+        if from_id in task_id_set and to_id in task_id_set:
+            fi = task_index[from_id]
+            ti = task_index[to_id]
+            arcs.append((fi, ti))
+            has_predecessor.add(ti)
+            has_successor.add(fi)
+
+    # Supersource -> tasks with no predecessor
+    for i in range(1, n_real + 1):
+        if i not in has_predecessor:
+            arcs.append((0, i))
+
+    # Tasks with no successor -> supersink
+    for i in range(1, n_real + 1):
+        if i not in has_successor:
+            arcs.append((i, abs_A - 1))
+
+    E = compute_transitive_closure(arcs, abs_A)
+
+    # Transfer times: Delta[i][j][r] = Euclidean distance between elements
+    # Supersource/supersink have zero transfer time
+    Delta = []
+    for i in range(abs_A):
+        Delta.append([])
+        for j in range(abs_A):
+            Delta[i].append([])
+            if i == j or i == 0 or i == abs_A - 1 or j == 0 or j == abs_A - 1:
+                Delta[i][j] = [0] * abs_R
+            else:
+                ei = task_elements[task_ids[i - 1]]
+                ej = task_elements[task_ids[j - 1]]
+                dist = int(math.sqrt(
+                    (ei["x"] - ej["x"])**2 +
+                    (ei["y"] - ej["y"])**2 +
+                    (ei["z"] - ej["z"])**2))
+                Delta[i][j] = [dist] * abs_R  # same distance for all resources
 
     T = compute_possible_transfers(abs_A, abs_R, Q, C, E)
 
@@ -330,6 +465,99 @@ def build_model_optal(inst):
 
 
 # =============================================================================
+# SETUP-TIME MODELS (no_overlap with transition matrices)
+# =============================================================================
+
+def _build_setup_data(inst):
+    """Prepare common data structures for setup-time models."""
+    abs_A, abs_R, C, Q, Delta = (
+        inst['abs_A'], inst['abs_R'], inst['C'], inst['Q'], inst['Delta'])
+
+    per_resource = []
+    for r in range(abs_R):
+        cap = C[r]
+        tasks_r = [j for j in range(abs_A) if Q[j][r] > 0]
+        if not tasks_r:
+            continue
+        # Transition matrix indexed by position in tasks_r
+        transitions = [[Delta[i][j][r] for j in tasks_r] for i in tasks_r]
+        per_resource.append((r, cap, tasks_r, transitions))
+    return per_resource
+
+
+def build_model_optal_setup(inst):
+    """Build OptalCP model for RCPSPTT using no_overlap with transition times."""
+    import optalcp as cp
+
+    abs_A, abs_R, p, C, Q, E = (
+        inst['abs_A'], inst['abs_R'], inst['p'], inst['C'],
+        inst['Q'], inst['E'])
+
+    mdl = cp.Model(name=f"rcpsptt_setup_{inst['name']}")
+    a = [mdl.interval_var(length=p[i], name=f'a_{i}') for i in range(abs_A)]
+    mdl.minimize(a[abs_A - 1].end())
+    mdl.enforce([a[i].end_before_start(a[j]) for i, j in E])
+
+    for r, cap, tasks_r, transitions in _build_setup_data(inst):
+        copies = {}
+        for j in tasks_r:
+            for m in range(cap):
+                copies[(j, m)] = mdl.interval_var(
+                    length=p[j], optional=True, name=f'c_{j}_r{r}_m{m}')
+
+        for j in tasks_r:
+            mdl.enforce(
+                mdl.sum(copies[(j, m)].presence() for m in range(cap)) == Q[j][r])
+            for m in range(cap):
+                mdl.enforce(a[j].start_at_start(copies[(j, m)]))
+
+        n_tasks_r = len(tasks_r)
+        for m in range(cap):
+            machine_intervals = [copies[(j, m)] for j in tasks_r]
+            seq = mdl.sequence_var(machine_intervals, types=list(range(n_tasks_r)),
+                                   name=f'seq_r{r}_m{m}')
+            mdl.enforce(seq.no_overlap(transitions))
+
+    return mdl
+
+
+def build_model_cpo_setup(inst):
+    """Build IBM CPO model for RCPSPTT using no_overlap with transition times."""
+    from docplex.cp.model import CpoModel
+
+    abs_A, abs_R, p, C, Q, E = (
+        inst['abs_A'], inst['abs_R'], inst['p'], inst['C'],
+        inst['Q'], inst['E'])
+
+    mdl = CpoModel(name=f"rcpsptt_cpo_setup_{inst['name']}")
+    a = [mdl.interval_var(size=p[i], name=f'a_{i}') for i in range(abs_A)]
+    mdl.add(mdl.minimize(mdl.end_of(a[abs_A - 1])))
+    mdl.add([mdl.end_before_start(a[i], a[j]) for i, j in E])
+
+    for r, cap, tasks_r, transitions in _build_setup_data(inst):
+        copies = {}
+        for j in tasks_r:
+            for m in range(cap):
+                copies[(j, m)] = mdl.interval_var(
+                    size=p[j], optional=True, name=f'c_{j}_r{r}_m{m}')
+
+        for j in tasks_r:
+            mdl.add(
+                mdl.sum(mdl.presence_of(copies[(j, m)]) for m in range(cap)) == Q[j][r])
+            for m in range(cap):
+                mdl.add(mdl.start_at_start(a[j], copies[(j, m)]))
+
+        n_tasks_r = len(tasks_r)
+        for m in range(cap):
+            machine_intervals = [copies[(j, m)] for j in tasks_r]
+            seq = mdl.sequence_var(machine_intervals, types=list(range(n_tasks_r)),
+                                   name=f'seq_r{r}_m{m}')
+            mdl.add(mdl.no_overlap(seq, transitions, is_direct=False))
+
+    return mdl
+
+
+# =============================================================================
 # SOLVER EXECUTION
 # =============================================================================
 
@@ -453,18 +681,27 @@ def solve_with_optal(mdl, nb_workers, time_limit, log_verbosity, tuned=False):
 # =============================================================================
 
 def solve_instance(filepath, solver_name, nb_workers, time_limit, log_verbosity,
-                   tuned=False):
+                   tuned=False, fmt=None):
     """Solve one RCPSPTT instance. Returns a result dict (JSON-serializable)."""
-    inst = load_instance(filepath)
+    if fmt is None:
+        fmt = "kraus" if filepath.endswith(".json") else "psplib"
+    if fmt == "kraus":
+        inst = load_kraus_instance(filepath)
+    else:
+        inst = load_instance(filepath)
 
     t_build_start = time.monotonic()
     if solver_name == "cpo":
         mdl = build_model_cpo(inst)
+    elif solver_name == "cpo_setup":
+        mdl = build_model_cpo_setup(inst)
+    elif solver_name == "optal_setup":
+        mdl = build_model_optal_setup(inst)
     else:
         mdl = build_model_optal(inst)
     build_time = round(time.monotonic() - t_build_start, 3)
 
-    if solver_name == "cpo":
+    if solver_name in ("cpo", "cpo_setup"):
         cmax, state, wall_time, best_solution_time = solve_with_cpo(
             mdl, nb_workers, time_limit, log_verbosity)
     else:
@@ -503,12 +740,31 @@ def _instance_set(name):
     return None
 
 
-def collect_instances(data_dir, sets=None):
-    """Collect _a.sm instance files matching the given set filters."""
-    data_dir = Path(data_dir)
-    files = sorted(data_dir.glob("*_a.sm"), key=_natural_sort_key)
+def collect_instances(data_dir, sets=None, fmt=None):
+    """Collect instance files matching the given set filters.
 
-    if sets:
+    fmt: "psplib" (*.sm), "kraus" (*.json), or None (auto-detect).
+    """
+    data_dir = Path(data_dir)
+
+    if fmt == "kraus":
+        files = sorted(data_dir.glob("*.json"), key=_natural_sort_key)
+    elif fmt == "psplib":
+        files = sorted(data_dir.glob("*_a.sm"), key=_natural_sort_key)
+    else:
+        # Auto-detect: if directory has .json files, use those; else .sm
+        json_files = sorted(data_dir.glob("*.json"), key=_natural_sort_key)
+        sm_files = sorted(data_dir.glob("*_a.sm"), key=_natural_sort_key)
+        if json_files and not sm_files:
+            fmt = "kraus"
+            files = json_files
+        elif sm_files:
+            fmt = "psplib"
+            files = sm_files
+        else:
+            files = []
+
+    if sets and fmt == "psplib":
         files = [f for f in files if _instance_set(f.stem.replace('_a', '')) in sets]
 
     return files
@@ -518,8 +774,21 @@ def collect_instances(data_dir, sets=None):
 # BATCH RUNNER WITH JSON TRACKING
 # =============================================================================
 
+def _instance_name(path):
+    """Extract instance name from path (works for both .sm and .json)."""
+    name = path.stem
+    if name.endswith('_a'):
+        name = name[:-2]
+    return name
+
+
+class _TotalTimeout(Exception):
+    pass
+
+
 def run_solver_batch(instances, solver_name, nb_workers, time_limit,
-                     log_verbosity, out_file, tuned=False):
+                     log_verbosity, out_file, tuned=False, fmt=None,
+                     total_limit=None):
     """Run a solver on all instances, tracking results as JSON.
 
     Supports resume: if out_file exists, previously solved instances are skipped.
@@ -533,7 +802,7 @@ def run_solver_batch(instances, solver_name, nb_workers, time_limit,
             all_results = json.load(f)
         solved_names = {r['instance'] for r in all_results}
         remaining = [inst for inst in instances
-                     if inst.stem.replace('_a', '') not in solved_names]
+                     if _instance_name(inst) not in solved_names]
         if len(remaining) != len(instances):
             print(f"    Resuming: {len(all_results)} previous results loaded, "
                   f"{len(remaining)} remaining")
@@ -546,20 +815,45 @@ def run_solver_batch(instances, solver_name, nb_workers, time_limit,
     total = len(instances)
 
     for idx, instance_path in enumerate(instances):
-        instance_name = instance_path.stem.replace('_a', '')
+        instance_name = _instance_name(instance_path)
         print(f"\n  [{idx+1}/{total}] {instance_name}")
         sys.stdout.flush()
 
+        def _alarm_handler(signum, frame):
+            raise _TotalTimeout(f"Total time limit ({total_limit}s) exceeded")
+
         try:
+            # Set total timeout (build + solve) via SIGALRM
+            if total_limit and hasattr(signal, 'SIGALRM'):
+                signal.signal(signal.SIGALRM, _alarm_handler)
+                signal.alarm(total_limit)
+
             result = solve_instance(
                 str(instance_path), solver_name,
-                nb_workers, time_limit, log_verbosity, tuned=tuned)
+                nb_workers, time_limit, log_verbosity, tuned=tuned, fmt=fmt)
 
             bst = result['best_solution_time']
             bst_str = f"{bst}s" if bst is not None else "N/A"
             print(f"    objective={result['objective']}  state={result['state']}  "
                   f"duration={result['duration']}s  "
                   f"best_solution_time={bst_str}")
+
+        except _TotalTimeout:
+            result = {
+                "instance": instance_name,
+                "solver": solver_name,
+                "n_jobs": None,
+                "n_resources": None,
+                "objective": None,
+                "state": "Timeout",
+                "duration": total_limit,
+                "build_time": None,
+                "best_solution_time": None,
+                "time_limit": time_limit,
+                "workers": nb_workers,
+                "error": f"Total limit {total_limit}s exceeded (build+solve)",
+            }
+            print(f"    TIMEOUT: total limit {total_limit}s exceeded")
 
         except Exception as e:
             result = {
@@ -577,6 +871,10 @@ def run_solver_batch(instances, solver_name, nb_workers, time_limit,
                 "error": str(e),
             }
             print(f"    ERROR: {e}", file=sys.stderr)
+
+        finally:
+            if total_limit and hasattr(signal, 'SIGALRM'):
+                signal.alarm(0)  # cancel alarm
 
         all_results.append(result)
 
@@ -636,10 +934,15 @@ Examples:
                         help='End index (exclusive)')
 
     # Solver options
-    parser.add_argument('--solver', choices=['optal', 'cpo', 'both'], default='both',
+    parser.add_argument('--solver',
+                        choices=['optal', 'optal_setup', 'cpo', 'cpo_setup', 'both', 'both_setup'],
+                        default='both',
                         help='Solver to use (default: both)')
     parser.add_argument('--timeLimit', type=int, default=60,
-                        help='Time limit per instance in seconds (default: 60)')
+                        help='Solver time limit per instance in seconds (default: 60)')
+    parser.add_argument('--totalLimit', type=int, default=None,
+                        help='Total time limit per instance incl. build (default: no limit). '
+                             'Kills the instance if build+solve exceeds this.')
     parser.add_argument('--workers', type=int, default=16,
                         help='Number of solver workers (default: 16)')
     parser.add_argument('--logLevel', type=int, default=0, choices=[0, 1, 2, 3],
@@ -650,6 +953,9 @@ Examples:
                         help=f'Data directory (default: {DEFAULT_DATA_DIR})')
     parser.add_argument('--output', type=str, default=None,
                         help='Output directory for results (default: results/rcpsptt/)')
+    parser.add_argument('--format', type=str, choices=['psplib', 'kraus'],
+                        default=None, dest='fmt',
+                        help='Instance format: psplib (.sm) or kraus (.json). Auto-detected if omitted.')
 
     # Tuning
     parser.add_argument('--tuned', action='store_true',
@@ -665,12 +971,16 @@ Examples:
     solvers = []
     if args.solver in ('optal', 'both'):
         solvers.append('optal')
+    if args.solver in ('optal_setup', 'both_setup'):
+        solvers.append('optal_setup')
     if args.solver in ('cpo', 'both'):
         solvers.append('cpo')
+    if args.solver in ('cpo_setup', 'both_setup'):
+        solvers.append('cpo_setup')
 
     # Collect instances
     data_dir = args.data or str(DEFAULT_DATA_DIR)
-    instances = collect_instances(data_dir, args.set)
+    instances = collect_instances(data_dir, args.set, fmt=args.fmt)
     instances = instances[args.start:args.end]
 
     if args.max:
@@ -698,7 +1008,9 @@ Examples:
     print(f"  Instances:  {len(instances)}" + (f" (max {args.max})" if args.max else ""))
     print(f"  Filters:    {', '.join(filter_desc) if filter_desc else 'none'}")
     print(f"  Solvers:    {', '.join(solvers)}")
-    print(f"  Time limit: {args.timeLimit}s per instance")
+    print(f"  Time limit: {args.timeLimit}s per instance (solver)")
+    if args.totalLimit:
+        print(f"  Total limit:{args.totalLimit}s per instance (build+solve)")
     print(f"  Workers:    {args.workers}")
     print(f"  Output:     {results_dir}")
 
@@ -733,7 +1045,8 @@ Examples:
         results = run_solver_batch(
             instances, solver_name,
             args.workers, args.timeLimit, args.logLevel,
-            out_file=out_file, tuned=args.tuned
+            out_file=out_file, tuned=args.tuned, fmt=args.fmt,
+            total_limit=args.totalLimit
         )
 
         print(f"\n  Saved: {out_file}")
